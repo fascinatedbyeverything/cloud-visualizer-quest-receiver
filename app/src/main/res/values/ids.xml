@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<resources>
+  <item type="id" name="command_message" />
+  <item type="id" name="command_class" />
+  <item type="id" name="video_panel_360" />
+  <item type="id" name="control_panel" />
+  <item type="id" name="transport_panel" />
+</resources>

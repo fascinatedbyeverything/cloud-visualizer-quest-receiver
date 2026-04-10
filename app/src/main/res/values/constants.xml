@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<resources>
+  <integer name="floor_id">1</integer>
+  <integer name="sky_video_id">5</integer>
+</resources>
