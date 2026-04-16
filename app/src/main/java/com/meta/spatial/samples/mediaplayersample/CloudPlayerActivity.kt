@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.WindowManager
 import androidx.annotation.OptIn
 import androidx.compose.runtime.mutableStateOf
 import androidx.media3.common.AudioAttributes
@@ -68,6 +69,7 @@ class CloudPlayerActivity : AppSystemActivity() {
     private var transportPanelEntity: Entity? = null
     private lateinit var locomotionSystem: LocomotionSystem
     private val positionHandler = Handler(Looper.getMainLooper())
+    private val retryHandler = Handler(Looper.getMainLooper())
     private val positionUpdater = object : Runnable {
         override fun run() {
             exoPlayer?.let { player ->
@@ -93,6 +95,8 @@ class CloudPlayerActivity : AppSystemActivity() {
         super.onCreate(savedInstanceState)
         locomotionSystem = systemManager.findSystem<LocomotionSystem>()
         volumeControlStream = AudioManager.STREAM_MUSIC
+        // Kiosk: never let the display sleep while the app has focus
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onSceneReady() {
@@ -106,33 +110,18 @@ class CloudPlayerActivity : AppSystemActivity() {
         )
         scene.updateIBLEnvironment("chromatic.env")
 
-        skyVideoPanel = Entity.create(Panel(R.id.video_panel_360), Transform(), Visible(false))
+        // Kiosk: video sphere only, visible from the start. No menu, no transport.
+        skyVideoPanel = Entity.create(Panel(R.id.video_panel_360), Transform(), Visible(true))
 
-        controlPanelEntity = Entity.create(
-            Panel(R.id.control_panel),
-            Transform(Pose(Vector3(0f, 1.3f, 2.0f))),
-            Grabbable(enabled = true, type = GrabbableType.FACE),
-        )
+        // Right-thumbstick click = recenter view. No other input bindings — hand pinches,
+        // A/B/X/Y, triggers, and grips all do nothing so accidental gestures can't stop the stream.
+        systemManager.registerSystem(RecenterInputSystem())
 
-        transportPanelEntity = Entity.create(
-            Panel(R.id.transport_panel),
-            Transform(Pose(Vector3(0f, 0.8f, 1.5f))),
-            Visible(false),
-            Grabbable(enabled = true, type = GrabbableType.FACE),
-        )
-
-        // Register B/Y button system (same pattern as SplatSample ControllerListenerSystem)
-        systemManager.registerSystem(ButtonInputSystem())
-
-        Log.i(TAG, "v3 Scene ready - panels created, ButtonInputSystem registered")
+        Log.i(TAG, "Kiosk scene ready — video panel visible, recenter-only input registered")
     }
 
     override fun registerPanels(): List<PanelRegistration> {
-        return listOf(
-            videoPanel360Registration(),
-            controlPanelRegistration(),
-            transportPanelRegistration(),
-        )
+        return listOf(videoPanel360Registration())
     }
 
     private fun videoPanel360Registration(): PanelRegistration {
@@ -143,7 +132,7 @@ class CloudPlayerActivity : AppSystemActivity() {
                     .setConnectTimeoutMs(15000)
                     .setReadTimeoutMs(15000)
                     .setAllowCrossProtocolRedirects(true)
-                    .setUserAgent("CloudVisualizerReceiver/1.0 Quest")
+                    .setUserAgent("CloudVisualizerReceiver/2.0 Quest")
 
                 val trackSelector = DefaultTrackSelector(this).apply {
                     setParameters(
@@ -206,12 +195,17 @@ class CloudPlayerActivity : AppSystemActivity() {
 
                             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                                 PlayerState.errorMessage.value = error.message ?: "Playback error"
-                                Log.e(TAG, "Player error: ${error.message}")
+                                Log.e(TAG, "Player error — retrying stream in 3s: ${error.message}")
+                                retryHandler.removeCallbacksAndMessages(null)
+                                retryHandler.postDelayed({
+                                    playStream(STREAM_URL, STREAM_TITLE)
+                                }, 3000L)
                             }
                         })
                     }
 
-                Log.i(TAG, "ExoPlayer created with HLS support")
+                Log.i(TAG, "ExoPlayer ready — auto-playing Visionary stream")
+                playStream(STREAM_URL, STREAM_TITLE)
             },
             settingsCreator = {
                 MediaPanelSettings(
@@ -368,36 +362,66 @@ class CloudPlayerActivity : AppSystemActivity() {
         PlayerState.transportVisible.value = !visible
     }
 
-    /** ECS System that polls controller button state each frame.
-     *  Same pattern as SplatSample.ControllerListenerSystem and Focus GeneralSystem. */
-    inner class ButtonInputSystem : SystemBase() {
+    /** Recenter the view by re-anchoring the LOCAL_FLOOR reference space to the
+     *  headset's current position + orientation. */
+    fun recenterView() {
+        Log.i(TAG, "Recenter — re-anchoring reference space")
+        scene.setReferenceSpace(ReferenceSpace.LOCAL_FLOOR)
+    }
+
+    /** Quit the app cleanly, returning the user to the Quest home. */
+    fun quitToHome() {
+        Log.i(TAG, "Quit — returning to Quest home")
+        finishAndRemoveTask()
+    }
+
+    /** ECS System — minimal controller bindings for kiosk mode:
+     *  Either thumbstick click = restart stream (reconnect if black/stalled)
+     *  Hold EITHER thumbstick click ≥ 3 seconds = quit to Quest home
+     *  Works with left-only (Psychedelic) or right-only (all others) controller. */
+    inner class RecenterInputSystem : SystemBase() {
+        private var leftHeldSinceMs: Long = 0L
+        private var rightHeldSinceMs: Long = 0L
+        private var quitFired: Boolean = false
+
         override fun execute() {
             val controllers = Query.where { has(Controller.id) }
             for (entity in controllers.eval()) {
                 val c = entity.getComponent<Controller>()
-                // B button: toggle transport on/off
-                if ((c.changedButtons and ButtonBits.ButtonB) != 0 &&
-                    (c.buttonState and ButtonBits.ButtonB) != 0
-                ) {
-                    Log.i(TAG, "B button - toggle transport")
-                    toggleTransport()
-                    return
+
+                val leftDown = (c.buttonState and ButtonBits.ButtonThumbLClick) != 0
+                val rightDown = (c.buttonState and ButtonBits.ButtonThumbRClick) != 0
+                val leftChanged = (c.changedButtons and ButtonBits.ButtonThumbLClick) != 0
+                val rightChanged = (c.changedButtons and ButtonBits.ButtonThumbRClick) != 0
+
+                val now = System.currentTimeMillis()
+
+                // Either thumbstick click — restart stream
+                if (leftChanged && leftDown) {
+                    leftHeldSinceMs = now
+                    quitFired = false
+                    Log.i(TAG, "Left thumbstick click — restarting stream")
+                    playStream(STREAM_URL, STREAM_TITLE)
                 }
-                // Y button: same as B (left controller)
-                if ((c.changedButtons and ButtonBits.ButtonY) != 0 &&
-                    (c.buttonState and ButtonBits.ButtonY) != 0
-                ) {
-                    Log.i(TAG, "Y button - toggle transport")
-                    toggleTransport()
-                    return
+
+                if (rightChanged && rightDown) {
+                    rightHeldSinceMs = now
+                    quitFired = false
+                    Log.i(TAG, "Right thumbstick click — restarting stream")
+                    playStream(STREAM_URL, STREAM_TITLE)
                 }
-                // A button: back to main menu (stop playback)
-                if ((c.changedButtons and ButtonBits.ButtonA) != 0 &&
-                    (c.buttonState and ButtonBits.ButtonA) != 0
-                ) {
-                    if (PlayerState.currentTitle.value.isNotEmpty()) {
-                        Log.i(TAG, "A button - stop playback, back to menu")
-                        stopPlayback()
+
+                // Release edges — reset timers
+                if (leftChanged && !leftDown) leftHeldSinceMs = 0L
+                if (rightChanged && !rightDown) rightHeldSinceMs = 0L
+
+                // Hold either thumbstick ≥ 3 seconds = quit
+                if (!quitFired) {
+                    val leftHeldMs = if (leftHeldSinceMs > 0L && leftDown) now - leftHeldSinceMs else 0L
+                    val rightHeldMs = if (rightHeldSinceMs > 0L && rightDown) now - rightHeldSinceMs else 0L
+                    if (leftHeldMs >= 3000L || rightHeldMs >= 3000L) {
+                        quitFired = true
+                        quitToHome()
                         return
                     }
                 }
@@ -412,11 +436,17 @@ class CloudPlayerActivity : AppSystemActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (PlayerState.isPlaying.value) exoPlayer?.play()
+        // Kiosk: whatever interrupted us, just resume playing the stream
+        exoPlayer?.let { player ->
+            if (!player.isPlaying) {
+                playStream(STREAM_URL, STREAM_TITLE)
+            }
+        }
     }
 
     override fun onSpatialShutdown() {
         positionHandler.removeCallbacks(positionUpdater)
+        retryHandler.removeCallbacksAndMessages(null)
         exoPlayer?.release()
         exoPlayer = null
         super.onSpatialShutdown()
@@ -425,15 +455,31 @@ class CloudPlayerActivity : AppSystemActivity() {
     companion object {
         private const val TAG = "CloudReceiver"
 
-        // Single live preset — mirrors the Vision Pro receiver's "MacBook Pro (this Mac)"
-        // one-tap entry. Edit the host here to add other Macs on the network. The path
-        // /live/stream is MediaMTX's default for OBS publishing path "live" + stream key
-        // "stream".
+        // Kiosk mode: one hard-wired stream, auto-played on app launch.
+        const val STREAM_URL = "http://visionary.local:8888/live/stream/index.m3u8"
+        const val STREAM_TITLE = "Visionary (M4 Pro 8K)"
+
+        // Legacy preset list retained for ControlPanel/TransportPanel (unused in kiosk mode).
+        // Three presets:
+        // 1. Visionary (M4 Pro) — primary 8K source machine, sub-1s LAN latency
+        // 2. MacBook Pro (M3) — fallback / dev box, sub-1s LAN latency
+        // 3. Cloudflare Stream Live — global CDN, ~2s latency, $5/mo + delivery
+        // All are HLS m3u8 URLs consumed by ExoPlayer's HlsMediaSource.
         val STREAMS = listOf(
             Stream(
-                "MacBook Pro (this Mac)",
+                "Visionary (M4 Pro 8K)",
+                "http://visionary.local:8888/live/stream/index.m3u8",
+                "LAN — 8K live VJ mix from visionary",
+            ),
+            Stream(
+                "MacBook Pro (M3)",
                 "http://fascintated-2.local:8888/live/stream/index.m3u8",
-                "Live VJ mix from Cloud Visualizer / OBS",
+                "LAN — sub-1s latency",
+            ),
+            Stream(
+                "Global (Cloudflare)",
+                "https://customer-uutaq63i96lrvqsr.cloudflarestream.com/197b8d9bc2aabd9f9b2f2dd9dca91b3d/manifest/video.m3u8?protocol=llhlsbeta",
+                "Worldwide CDN — ~2s latency",
             ),
         )
     }
